@@ -1,62 +1,4 @@
 #include "GlobalCallAnalyzer.hpp"
-#include "PEDefs.hpp"
-
-// Windows API function declarations for cross-compilation
-// We'll define only what we need to avoid conflicts with PEDefs.hpp
-#if defined(_WIN32) && !defined(__MINGW32__)
-    #include <windows.h>
-    #include <psapi.h>
-#else
-    // MinGW cross-compilation definitions
-    typedef void* HANDLE;
-    typedef void* HMODULE;
-    typedef void* LPVOID;
-    typedef char* LPSTR;
-    typedef const char* LPCSTR;
-    typedef wchar_t* LPWSTR;
-    typedef const wchar_t* LPCWSTR;
-    typedef DWORD* LPDWORD;
-    typedef int BOOL;
-    typedef unsigned long ULONG;
-    typedef size_t SIZE_T;
-    
-    // Constants
-    #define INVALID_HANDLE_VALUE ((HANDLE)(long long)-1)
-    #define GENERIC_READ 0x80000000L
-    #define FILE_SHARE_READ 0x00000001
-    #define OPEN_EXISTING 3
-    #define FILE_ATTRIBUTE_NORMAL 0x80
-    #define PAGE_READONLY 0x02
-    #define FILE_MAP_READ 0x0004
-    
-    // Structures
-    typedef union _LARGE_INTEGER {
-        struct {
-            DWORD LowPart;
-            long HighPart;
-        };
-        long long QuadPart;
-    } LARGE_INTEGER;
-    
-    typedef struct _MODULEINFO {
-        LPVOID lpBaseOfDll;
-        DWORD SizeOfImage;
-        LPVOID EntryPoint;
-    } MODULEINFO, *LPMODULEINFO;
-    
-    // Function declarations
-    extern "C" {
-        HANDLE __stdcall CreateFileA(LPCSTR, DWORD, DWORD, void*, DWORD, DWORD, HANDLE);
-        BOOL __stdcall CloseHandle(HANDLE);
-        BOOL __stdcall GetFileSizeEx(HANDLE, LARGE_INTEGER*);
-        HANDLE __stdcall CreateFileMappingA(HANDLE, void*, DWORD, DWORD, DWORD, LPCSTR);
-        LPVOID __stdcall MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T);
-        BOOL __stdcall UnmapViewOfFile(LPVOID);
-        HMODULE __stdcall GetModuleHandleA(LPCSTR);
-        HANDLE __stdcall GetCurrentProcess();
-        BOOL __stdcall GetModuleInformation(HANDLE, HMODULE, LPMODULEINFO, DWORD);
-    }
-#endif
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -65,6 +7,10 @@
 #include <functional>
 #include <chrono>
 #include <algorithm>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // Helper to sort map keys for consistent, deterministic output.
 template <typename K, typename V>
@@ -82,34 +28,26 @@ std::vector<K> get_sorted_keys(const std::unordered_map<K, V>& umap) {
 class MemoryMappedFile {
 public:
     MemoryMappedFile(const char* path) {
-        m_file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (m_file == INVALID_HANDLE_VALUE) throw std::runtime_error("Failed to open file");
+        m_fd = open(path, O_RDONLY);
+        if (m_fd == -1) throw std::runtime_error("Failed to open file");
 
-        LARGE_INTEGER file_size;
-        if (!GetFileSizeEx(m_file, &file_size)) {
-            CloseHandle(m_file);
+        struct stat sb;
+        if (fstat(m_fd, &sb) == -1) {
+            close(m_fd);
             throw std::runtime_error("Failed to get file size");
         }
-        m_size = file_size.QuadPart;
+        m_size = sb.st_size;
 
-        m_mapping = CreateFileMappingA(m_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!m_mapping) {
-            CloseHandle(m_file);
-            throw std::runtime_error("Failed to create file mapping");
-        }
-
-        m_view = MapViewOfFile(m_mapping, FILE_MAP_READ, 0, 0, 0);
-        if (!m_view) {
-            CloseHandle(m_mapping);
-            CloseHandle(m_file);
-            throw std::runtime_error("Failed to map view of file");
+        m_view = mmap(nullptr, m_size, PROT_READ, MAP_PRIVATE, m_fd, 0);
+        if (m_view == MAP_FAILED) {
+            close(m_fd);
+            throw std::runtime_error("Failed to map file");
         }
     }
 
     ~MemoryMappedFile() {
-        if (m_view) UnmapViewOfFile(m_view);
-        if (m_mapping) CloseHandle(m_mapping);
-        if (m_file != INVALID_HANDLE_VALUE) CloseHandle(m_file);
+        if (m_view && m_view != MAP_FAILED) munmap(m_view, m_size);
+        if (m_fd != -1) close(m_fd);
     }
 
     std::span<const uint8_t> GetView() const {
@@ -117,10 +55,9 @@ public:
     }
 
 private:
-    HANDLE m_file = INVALID_HANDLE_VALUE;
-    HANDLE m_mapping = nullptr;
+    int m_fd = -1;
     void* m_view = nullptr;
-    uint64_t m_size = 0;
+    size_t m_size = 0;
 };
 
 void PrintReports(const std::string& label, const std::vector<BinA::GlobalAccessReport>& reports) {
@@ -186,35 +123,17 @@ void PrintReports(const std::string& label, const std::vector<BinA::GlobalAccess
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage:\n"
-                  << "  " << argv[0] << " <PE_file_path>\n"
-                  << "  " << argv[0] << " --loaded <module_name>\n";
+        std::cerr << "Usage: " << argv[0] << " <PE_file_path>\n";
         return 1;
     }
 
     try {
         auto start_time = std::chrono::high_resolution_clock::now();
-        std::vector<BinA::GlobalAccessReport> reports;
-        std::string label;
-
-        if (std::string(argv[1]) == "--loaded" && argc >= 3) {
-            label = std::string(argv[2]) + " (loaded)";
-            HMODULE mod = GetModuleHandleA(argv[2]);
-            if (!mod) throw std::runtime_error("Module not loaded: " + std::string(argv[2]));
-
-            MODULEINFO mi{};
-            if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi))) {
-                throw std::runtime_error("GetModuleInformation failed");
-            }
-            std::span<const uint8_t> view(reinterpret_cast<const uint8_t*>(mi.lpBaseOfDll), mi.SizeOfImage);
-            BinA::GlobalCallAnalyzer gca(view, true);
-            reports = gca.Analyze();
-        } else {
-            label = argv[1];
-            MemoryMappedFile mmf(argv[1]);
-            BinA::GlobalCallAnalyzer gca(mmf.GetView(), false);
-            reports = gca.Analyze();
-        }
+        
+        std::string label = argv[1];
+        MemoryMappedFile mmf(argv[1]);
+        BinA::GlobalCallAnalyzer gca(mmf.GetView(), false);
+        auto reports = gca.Analyze();
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);

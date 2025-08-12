@@ -1,118 +1,203 @@
 #pragma once
-#include <Zydis/Zydis.h>
+
 #include <cstdint>
-#include <optional>
+#include <span>
+#include <vector>
+#include <string>
 #include <span>
 #include <unordered_map>
-#include <vector>
+#include <Zydis/Zydis.h>
+#include "PEDefs.hpp" // Cross-platform PE definitions
+
+// Define GCA_ENABLE_PAR to 0 to disable C++17 parallel algorithms for debugging or on unsupported compilers.
+#ifndef GCA_ENABLE_PAR
+#define GCA_ENABLE_PAR 1
+#endif
 
 namespace BinA {
 
-enum class AccessKind : uint8_t { VIRTUAL_CALL, DATA_LOAD, DATA_STORE };
+// =================================================================================================
+// Data Model for Analysis Reports
+// These structs define the output of the analysis, compatible with the original display logic but
+// extended with richer classification information.
+// =================================================================================================
 
-// Type inference for globals
-enum class InferredType : uint8_t {
-    UNKNOWN,
-    BYTE,      // 8-bit
-    WORD,      // 16-bit
-    DWORD,     // 32-bit
-    QWORD,     // 64-bit
-    POINTER,   // Pointer (64-bit on x64)
-    FLOAT,     // 32-bit float
-    DOUBLE,    // 64-bit double
-    FUNCTION_POINTER,  // Called through
-    STRUCT     // Complex/mixed accesses
-};
-
+/**
+ * @brief Contains type inference information gathered from instruction usage.
+ */
 struct TypeInfo {
-    InferredType type = InferredType::UNKNOWN;
-    size_t confidence = 0;  // How many accesses support this type
-    std::unordered_map<size_t, size_t> size_histogram;  // operand size -> count
-    bool has_float_ops = false;
-    bool has_calls = false;
+    bool has_calls = false;      ///< True if the memory at this offset was used in a CALL instruction.
+    bool has_float_ops = false;  ///< True if used with floating-point/SSE/AVX instructions.
+    std::unordered_map<size_t, size_t> size_histogram; ///< Maps operand size in bytes to access frequency.
 };
 
-// Maximum depth for nested pointer tracking
-constexpr size_t MAX_NESTING_DEPTH = 2;
-
-// Forward declaration for nested tracking
-struct NestedAccess;
-
-// Tracks statistics for accesses at a specific offset
-struct OffsetStats {
-    int64_t   relative{};  // Changed to int64_t to handle negative offsets
-    size_t    call_hits  = 0;
-    size_t    load_hits  = 0;
-    size_t    store_hits = 0;
-    TypeInfo  type_info;
-    
-    // Map of nested accesses: offset -> NestedAccess
-    // This tracks second-level dereferences (e.g., when this offset contains a pointer)
-    std::unordered_map<int64_t, NestedAccess> nested_accesses;
-};
-
-// Represents a second-level access through a dereferenced pointer
+/**
+ * @brief Represents an access to a field within a nested structure.
+ *
+ * This is used for accesses like `base->ptr_field->some_other_field`.
+ */
 struct NestedAccess {
-    int64_t dereferenced_offset{};  // Offset being accessed through the pointer (signed)
-    size_t call_hits = 0;
     size_t load_hits = 0;
     size_t store_hits = 0;
+    size_t call_hits = 0;
     TypeInfo type_info;
-    
-    // For deeper nesting (if needed in future), but limited by MAX_NESTING_DEPTH
+    /// @brief Further nested accesses, keyed by their relative offset.
     std::unordered_map<int64_t, NestedAccess> nested_accesses;
 };
 
-// Tracks when a register contains a loaded pointer value
-struct DereferencedPointer {
-    uint64_t source_global_va{};     // Global variable the pointer was loaded from
-    int64_t source_offset{};         // Offset within the global where pointer was loaded (signed)
-    ZydisRegister loaded_register{}; // Register containing the loaded pointer
-    size_t instruction_index{};      // Instruction where the load occurred
-    size_t nesting_level = 1;        // Current nesting depth (1 = first dereference)
-    int64_t accumulated_offset{};    // Total offset adjustment from pointer arithmetic
+/**
+ * @brief Represents all accesses to a specific offset within a global variable.
+ */
+struct OffsetStats {
+    int64_t relative = 0; ///< The offset from the global variable's base address.
+    size_t load_hits = 0;
+    size_t store_hits = 0;
+    size_t call_hits = 0;
+    TypeInfo type_info;
+    /// @brief Nested accesses originating from a pointer at this offset.
+    std::unordered_map<int64_t, NestedAccess> nested_accesses;
 };
 
+/**
+ * @brief The top-level report for a single global variable.
+ */
 struct GlobalAccessReport {
-    uint64_t                                   global_va{};
-    std::unordered_map<int64_t, OffsetStats>  per_offset;  // Changed to int64_t for signed offsets
+    uint64_t global_va = 0; ///< The virtual address of the global variable.
+    /// @brief A map of all first-level offsets accessed within this global.
+    std::unordered_map<int64_t, OffsetStats> per_offset;
+
+    // --- Extended Intelligence Fields ---
+    std::string section_name; ///< e.g., ".rdata", ".data"
+    enum class SectionType { TEXT, RDATA, DATA, IDATA, PDATA, XDATA, RSRC, TLS, OTHER } section_type = SectionType::OTHER;
+
+    bool likely_vtable = false;     ///< Heuristic: true if it looks like a C++ v-table.
+    bool likely_jump_table = false; ///< Heuristic: true if used as a base for an indexed jump.
+    bool likely_string = false;     ///< Heuristic: true if it points to a printable, null-terminated string.
+    std::string string_preview;     ///< A short preview of the string content if likely_string is true.
+    bool is_in_iat = false;         ///< True if the global VA is within the PE's Import Address Table.
 };
+
+/**
+ * @brief The set of possible inferred types for a given memory location.
+ */
+enum class InferredType {
+    UNKNOWN, BYTE, WORD, DWORD, QWORD, POINTER, FLOAT, DOUBLE, FUNCTION_POINTER, STRUCT
+};
+
+
+// =================================================================================================
+// Core Analyzer Class
+// =================================================================================================
 
 class GlobalCallAnalyzer {
 public:
-    explicit GlobalCallAnalyzer(std::span<const uint8_t> module_view);
+    /**
+     * @brief Constructs the analyzer for a given binary view.
+     * @param module_view A span covering the binary data.
+     * @param is_memory_image Set to `true` if the view is from a loaded module in memory (respects RVAs).
+     *                        Set to `false` if the view is from a raw file on disk (respects file offsets).
+     *                        This is critical for correct VA mapping.
+     */
+    GlobalCallAnalyzer(std::span<const uint8_t> module_view, bool is_memory_image);
 
-    /** Disassemble .text and return one report per distinct global handle. */
-    [[nodiscard]] std::vector<GlobalAccessReport> Analyze() const;
+    /**
+     * @brief Runs the full analysis pipeline.
+     * @return A vector of reports, one for each discovered global variable.
+     */
+    std::vector<GlobalAccessReport> Analyze() const;
 
-private:
-    // helpers
-    void ParsePE();
-    static bool IsRIPRelativeMovOrLEA(const ZydisDecodedInstruction&, const ZydisDecodedOperand&);
-    static bool OperandReads(const ZydisDecodedOperand& op);
-    static bool OperandWrites(const ZydisDecodedOperand& op);
-    static ZydisRegister GetFullRegister(ZydisRegister reg);
-    static bool RegistersOverlap(ZydisRegister reg1, ZydisRegister reg2);
+    // --- Public Static Helpers ---
 
-    // analysis
-    void ProcessInstruction(size_t idx,
-                            uint64_t ip,
-                            const ZydisDecodedInstruction& insn,
-                            const ZydisDecodedOperand* operands,
-                            std::vector<GlobalAccessReport>& reports,
-                            std::unordered_map<ZydisRegister, DereferencedPointer>& register_pointer_map) const;
-    
-public:
-    // Type inference utilities
     static InferredType InferTypeFromStats(const OffsetStats& stats);
     static InferredType InferTypeFromStats(const NestedAccess& nested);
     static const char* TypeToString(InferredType type);
 
 private:
-    
+    // =============================================================================================
+    // Internal Structures for Analysis
+    // =============================================================================================
+
+    /**
+     * @brief Represents a pointer being tracked in a register during analysis.
+     *
+     * This struct contains the full "provenance" of a pointer, allowing for deep analysis.
+     */
+    struct TrackedPointer {
+        uint64_t source_global_va = 0;  ///< The root global variable this pointer originated from.
+        /// @brief The sequence of offsets taken to reach this pointer. Empty for a root pointer.
+        /// e.g., for `A->B->C`, the path would be `{offset_of_B, offset_of_C}`.
+        std::vector<int64_t> path;
+        /// @brief Pointer arithmetic (`ADD`/`SUB`/`LEA`) offset accumulated since the last dereference.
+        int64_t accumulated_offset = 0;
+    };
+
+    /// @brief Maps a full 64-bit register to the pointer it's currently tracking.
+    using RegisterState = std::unordered_map<ZydisRegister, TrackedPointer>;
+
+    /**
+     * @brief Lightweight metadata for instructions, used for fast filtering.
+     */
+    struct InstructionMetadata {
+        uint32_t offset = 0;  ///< Offset within the .text section
+        uint8_t length = 0;   ///< Instruction length in bytes
+        uint8_t flags = 0;    ///< Flags for quick filtering
+    };
+
+    // Flag constants for InstructionMetadata
+    static constexpr uint8_t FLAG_NONE = 0;
+    static constexpr uint8_t FLAG_IS_ROOT_CANDIDATE = 1;
+    static constexpr uint8_t FLAG_IS_CALL = 2;
+    static constexpr uint8_t FLAG_IS_RET = 4;
+    static constexpr uint8_t FLAG_IS_JMP_OR_BRANCH = 8;
+
+    /**
+     * @brief Internal representation of a PE section.
+     */
+    struct Section {
+        std::string name;
+        uint64_t va_start = 0, va_end = 0;
+        uint32_t rva_start = 0, rva_end = 0;
+        uint32_t raw_ptr = 0, raw_size = 0;
+        uint32_t characteristics = 0;
+        GlobalAccessReport::SectionType kind = GlobalAccessReport::SectionType::OTHER;
+    };
+
+    // =============================================================================================
+    // Private Methods
+    // =============================================================================================
+
+    // --- Setup & Parsing ---
+    void ParsePE();
+    std::span<const uint8_t> GetTextBytes() const;
+    void BuildMetadataIndex() const;
+    std::span<const uint8_t> SpanForVA(uint64_t va, size_t size) const;
+    const Section* FindSectionByVA(uint64_t va) const;
+
+    // --- Core Analysis Pipeline ---
+    void ProcessRoot(size_t root_idx,
+                     std::unordered_map<uint64_t, GlobalAccessReport>& reports) const;
+
+    // --- Heuristics & Classification ---
+    void EnrichReport(GlobalAccessReport& rep, bool was_from_lea) const;
+    bool LooksLikeVTable(uint64_t va) const;
+    bool LooksLikeAscii(uint64_t va, std::string& out_preview) const;
+    bool LooksLikeJumpTablePattern(size_t root_index, ZydisRegister base_reg) const;
+
+    // =============================================================================================
+    // Member Variables
+    // =============================================================================================
+
     std::span<const uint8_t> m_view;
-    std::span<const uint8_t> m_text;
-    uint64_t                 m_text_va = 0;
+    bool m_is_memory_image;
+
+    // --- PE Info ---
+    uint64_t m_image_base = 0;
+    std::vector<Section> m_sections;
+    uint64_t m_iat_va = 0, m_iat_end = 0;
+
+    // --- Lightweight Metadata Index ---
+    mutable std::vector<InstructionMetadata> m_metadata_index;
+    uint64_t m_text_va = 0;
 };
 
 } // namespace BinA
