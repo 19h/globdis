@@ -1,542 +1,521 @@
 #include "GlobalCallAnalyzer.hpp"
-#include <windows.h>
-#include <psapi.h>
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
 #include <iomanip>
+#include <algorithm>
+#include <functional>
+#include <thread>
+
+#if GCA_ENABLE_PAR
+#include <execution>
+#include <mutex>
+#endif
 
 namespace BinA {
-// PE parsing (NO win32 at runtime  we already received a view!)
 
-void GlobalCallAnalyzer::ParsePE() {
-    if (m_view.size() < sizeof(IMAGE_DOS_HEADER))
-        throw std::runtime_error("DOS hdr too small");
+// =================================================================================================
+// Utility Functions
+// =================================================================================================
 
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m_view.data());
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) throw std::runtime_error("Bad MZ");
+// A small set of helper functions kept local to this translation unit.
+namespace {
 
-    const auto nt_off = dos->e_lfanew;
-    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m_view.data() + nt_off);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("Bad PE");
-
-    const auto sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        if (!std::strncmp(reinterpret_cast<const char*>(sec[i].Name), ".text", 5)) {
-            m_text_va  = nt->OptionalHeader.ImageBase + sec[i].VirtualAddress;
-            m_text     = m_view.subspan(sec[i].VirtualAddress, sec[i].Misc.VirtualSize);
-            return;
-        }
-    }
-    throw std::runtime_error(".text not found");
+// Returns the full 64-bit general-purpose register for any of its sub-registers.
+ZydisRegister GetFullRegister(ZydisRegister reg) {
+    return ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
 }
 
-// ------------------------------------------------------------------
-// ctor
+// Checks if an operand is read by the instruction.
+bool OperandReads(const ZydisDecodedOperand& op) {
+    return (op.actions & ZYDIS_OPERAND_ACTION_READ) != 0;
+}
 
-GlobalCallAnalyzer::GlobalCallAnalyzer(std::span<const uint8_t> mv) : m_view(mv) {
+// Checks if an operand is written by the instruction.
+bool OperandWrites(const ZydisDecodedOperand& op) {
+    return (op.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0;
+}
+
+// Recursively records a memory access, traversing the nested structure as needed.
+void RecordAccess(GlobalAccessReport& report,
+                  const std::vector<int64_t>& path,
+                  int64_t final_offset,
+                  const ZydisDecodedInstruction& instr,
+                  const ZydisDecodedOperand& mem_op) {
+
+    // Start at the top-level offset map.
+    std::unordered_map<int64_t, OffsetStats>* current_level_offsets = &report.per_offset;
+    NestedAccess* current_level_nested = nullptr;
+
+    // Traverse the path to find the correct parent node.
+    for (int64_t offset_in_path : path) {
+        if (current_level_offsets) {
+            // This is the first level of nesting.
+            auto& stats = (*current_level_offsets)[offset_in_path];
+            stats.relative = offset_in_path;
+            current_level_nested = &stats.nested_accesses[0]; // Placeholder for the pointer itself
+            current_level_offsets = nullptr;
+        } else {
+            // Deeper levels of nesting.
+            current_level_nested = &current_level_nested->nested_accesses[offset_in_path];
+        }
+    }
+
+    // Get a pointer to the stats object we need to update.
+    TypeInfo* type_info = nullptr;
+    size_t* call_hits = nullptr;
+    size_t* load_hits = nullptr;
+    size_t* store_hits = nullptr;
+
+    if (current_level_nested) {
+        // This is a nested access.
+        auto& nested_stats = current_level_nested->nested_accesses[final_offset];
+        type_info = &nested_stats.type_info;
+        call_hits = &nested_stats.call_hits;
+        load_hits = &nested_stats.load_hits;
+        store_hits = &nested_stats.store_hits;
+    } else {
+        // This is a first-level access.
+        auto& stats = report.per_offset[final_offset];
+        stats.relative = final_offset;
+        type_info = &stats.type_info;
+        call_hits = &stats.call_hits;
+        load_hits = &stats.load_hits;
+        store_hits = &stats.store_hits;
+    }
+
+    // Update the statistics based on the instruction.
+    if (instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+        (*call_hits)++;
+        type_info->has_calls = true;
+    } else {
+        if (OperandReads(mem_op)) (*load_hits)++;
+        if (OperandWrites(mem_op)) (*store_hits)++;
+    }
+
+    type_info->size_histogram[mem_op.size / 8]++;
+
+    switch (instr.meta.category) {
+        case ZYDIS_CATEGORY_SSE:
+        case ZYDIS_CATEGORY_AVX:
+        case ZYDIS_CATEGORY_X87_ALU:
+            type_info->has_float_ops = true;
+            break;
+        default:
+            break;
+    }
+}
+
+} // anonymous namespace
+
+// =================================================================================================
+// Constructor & PE Parsing
+// =================================================================================================
+
+GlobalCallAnalyzer::GlobalCallAnalyzer(std::span<const uint8_t> module_view, bool is_memory_image)
+    : m_view(module_view), m_is_memory_image(is_memory_image) {
     ParsePE();
 }
 
-// ------------------------------------------------------------------
-// tiny helpers
+void GlobalCallAnalyzer::ParsePE() {
+    if (m_view.size() < sizeof(IMAGE_DOS_HEADER)) throw std::runtime_error("DOS header too small");
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m_view.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) throw std::runtime_error("Bad MZ signature");
 
-bool GlobalCallAnalyzer::IsRIPRelativeMovOrLEA(const ZydisDecodedInstruction& insn,
-                                               const ZydisDecodedOperand& op) {
-    if (op.type != ZYDIS_OPERAND_TYPE_MEMORY)       return false;
-    if (op.mem.base != ZYDIS_REGISTER_RIP)          return false;
-    
-    // For MOV and LEA instructions that load from RIP-relative addresses
-    // We'll accept any MOV/LEA with RIP-relative addressing and filter later
-    return (insn.mnemonic == ZYDIS_MNEMONIC_MOV || insn.mnemonic == ZYDIS_MNEMONIC_LEA);
-}
+    const auto nt_off = dos->e_lfanew;
+    if (nt_off + sizeof(IMAGE_NT_HEADERS64) > m_view.size()) throw std::runtime_error("PE header out of bounds");
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m_view.data() + nt_off);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("Bad PE signature");
+    if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) throw std::runtime_error("Only 64-bit PE files are supported");
 
-bool GlobalCallAnalyzer::OperandReads(const ZydisDecodedOperand& op)  {
-    return op.actions & ZYDIS_OPERAND_ACTION_READ;
-}
-bool GlobalCallAnalyzer::OperandWrites(const ZydisDecodedOperand& op) {
-    return op.actions & ZYDIS_OPERAND_ACTION_WRITE;
-}
+    m_image_base = nt->OptionalHeader.ImageBase;
 
-// Get the full 64-bit register for any sub-register
-ZydisRegister GlobalCallAnalyzer::GetFullRegister(ZydisRegister reg) {
-    // Handle sub-registers by mapping to their full 64-bit version
-    switch (reg) {
-        // RAX family
-        case ZYDIS_REGISTER_AL:
-        case ZYDIS_REGISTER_AH:
-        case ZYDIS_REGISTER_AX:
-        case ZYDIS_REGISTER_EAX:
-        case ZYDIS_REGISTER_RAX:
-            return ZYDIS_REGISTER_RAX;
-        
-        // RBX family
-        case ZYDIS_REGISTER_BL:
-        case ZYDIS_REGISTER_BH:
-        case ZYDIS_REGISTER_BX:
-        case ZYDIS_REGISTER_EBX:
-        case ZYDIS_REGISTER_RBX:
-            return ZYDIS_REGISTER_RBX;
-        
-        // RCX family
-        case ZYDIS_REGISTER_CL:
-        case ZYDIS_REGISTER_CH:
-        case ZYDIS_REGISTER_CX:
-        case ZYDIS_REGISTER_ECX:
-        case ZYDIS_REGISTER_RCX:
-            return ZYDIS_REGISTER_RCX;
-        
-        // RDX family
-        case ZYDIS_REGISTER_DL:
-        case ZYDIS_REGISTER_DH:
-        case ZYDIS_REGISTER_DX:
-        case ZYDIS_REGISTER_EDX:
-        case ZYDIS_REGISTER_RDX:
-            return ZYDIS_REGISTER_RDX;
-        
-        // RSI family
-        case ZYDIS_REGISTER_SIL:
-        case ZYDIS_REGISTER_SI:
-        case ZYDIS_REGISTER_ESI:
-        case ZYDIS_REGISTER_RSI:
-            return ZYDIS_REGISTER_RSI;
-        
-        // RDI family
-        case ZYDIS_REGISTER_DIL:
-        case ZYDIS_REGISTER_DI:
-        case ZYDIS_REGISTER_EDI:
-        case ZYDIS_REGISTER_RDI:
-            return ZYDIS_REGISTER_RDI;
-        
-        // RBP family
-        case ZYDIS_REGISTER_BPL:
-        case ZYDIS_REGISTER_BP:
-        case ZYDIS_REGISTER_EBP:
-        case ZYDIS_REGISTER_RBP:
-            return ZYDIS_REGISTER_RBP;
-        
-        // RSP family
-        case ZYDIS_REGISTER_SPL:
-        case ZYDIS_REGISTER_SP:
-        case ZYDIS_REGISTER_ESP:
-        case ZYDIS_REGISTER_RSP:
-            return ZYDIS_REGISTER_RSP;
-        
-        // R8-R15 families
-        case ZYDIS_REGISTER_R8B:
-        case ZYDIS_REGISTER_R8W:
-        case ZYDIS_REGISTER_R8D:
-        case ZYDIS_REGISTER_R8:
-            return ZYDIS_REGISTER_R8;
-            
-        case ZYDIS_REGISTER_R9B:
-        case ZYDIS_REGISTER_R9W:
-        case ZYDIS_REGISTER_R9D:
-        case ZYDIS_REGISTER_R9:
-            return ZYDIS_REGISTER_R9;
-            
-        case ZYDIS_REGISTER_R10B:
-        case ZYDIS_REGISTER_R10W:
-        case ZYDIS_REGISTER_R10D:
-        case ZYDIS_REGISTER_R10:
-            return ZYDIS_REGISTER_R10;
-            
-        case ZYDIS_REGISTER_R11B:
-        case ZYDIS_REGISTER_R11W:
-        case ZYDIS_REGISTER_R11D:
-        case ZYDIS_REGISTER_R11:
-            return ZYDIS_REGISTER_R11;
-            
-        case ZYDIS_REGISTER_R12B:
-        case ZYDIS_REGISTER_R12W:
-        case ZYDIS_REGISTER_R12D:
-        case ZYDIS_REGISTER_R12:
-            return ZYDIS_REGISTER_R12;
-            
-        case ZYDIS_REGISTER_R13B:
-        case ZYDIS_REGISTER_R13W:
-        case ZYDIS_REGISTER_R13D:
-        case ZYDIS_REGISTER_R13:
-            return ZYDIS_REGISTER_R13;
-            
-        case ZYDIS_REGISTER_R14B:
-        case ZYDIS_REGISTER_R14W:
-        case ZYDIS_REGISTER_R14D:
-        case ZYDIS_REGISTER_R14:
-            return ZYDIS_REGISTER_R14;
-            
-        case ZYDIS_REGISTER_R15B:
-        case ZYDIS_REGISTER_R15W:
-        case ZYDIS_REGISTER_R15D:
-        case ZYDIS_REGISTER_R15:
-            return ZYDIS_REGISTER_R15;
-        
-        default:
-            return reg;
-    }
-}
-
-// Check if two registers overlap (e.g., RAX and EAX)
-bool GlobalCallAnalyzer::RegistersOverlap(ZydisRegister reg1, ZydisRegister reg2) {
-    return GetFullRegister(reg1) == GetFullRegister(reg2);
-}
-
-// ------------------------------------------------------------------
-// main loop
-
-void GlobalCallAnalyzer::ProcessInstruction(size_t idx,
-                                            uint64_t ip,
-                                            const ZydisDecodedInstruction& insn,
-                                            const ZydisDecodedOperand* operands,
-                                            std::vector<GlobalAccessReport>& reports,
-                                            std::unordered_map<ZydisRegister, DereferencedPointer>& register_pointer_map) const
-{
-    // Step 1: Handle register-to-register moves (aliasing)
-    if (insn.mnemonic == ZYDIS_MNEMONIC_MOV && insn.operand_count >= 2) {
-        const auto& src = operands[1];
-        const auto& dst = operands[0];
-        
-        if (src.type == ZYDIS_OPERAND_TYPE_REGISTER && dst.type == ZYDIS_OPERAND_TYPE_REGISTER) {
-            ZydisRegister src_full = GetFullRegister(src.reg.value);
-            ZydisRegister dst_full = GetFullRegister(dst.reg.value);
-            
-            // Check if source register contains a tracked pointer
-            auto it = register_pointer_map.find(src_full);
-            if (it != register_pointer_map.end()) {
-                // Copy the pointer tracking to the destination register
-                DereferencedPointer alias = it->second;
-                alias.loaded_register = dst_full;
-                register_pointer_map[dst_full] = alias;
-                
-                // Debug: print alias and nesting levels
-                std::cerr << "Debug: Alias assignment: " << ZydisRegisterGetString(dst_full) 
-                          << " now holds alias of " << ZydisRegisterGetString(src_full) 
-                          << " with nesting level " << alias.nesting_level 
-                          << " and offset " << alias.accumulated_offset << '\n';
-            } else if (OperandWrites(dst)) {
-                // Destination is being overwritten with non-pointer value
-                register_pointer_map.erase(dst_full);
-            }
-        }
-    }
-    
-    // Step 2: Handle pointer arithmetic (add/sub with immediate)
-    if ((insn.mnemonic == ZYDIS_MNEMONIC_ADD || insn.mnemonic == ZYDIS_MNEMONIC_SUB || 
-         insn.mnemonic == ZYDIS_MNEMONIC_LEA) && insn.operand_count >= 2) {
-        const auto& dst = operands[0];
-        
-        if (dst.type == ZYDIS_OPERAND_TYPE_REGISTER) {
-            ZydisRegister dst_full = GetFullRegister(dst.reg.value);
-            auto it = register_pointer_map.find(dst_full);
-            
-            if (it != register_pointer_map.end()) {
-                // Handle LEA special case
-                if (insn.mnemonic == ZYDIS_MNEMONIC_LEA && operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-                    const auto& mem = operands[1].mem;
-                    if (RegistersOverlap(mem.base, dst_full)) {
-                        // LEA modifies the offset
-                        it->second.accumulated_offset += mem.disp.value;
-                    }
-                }
-                // Handle ADD/SUB with immediate
-                else if (operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                    int64_t offset = operands[1].imm.value.s;
-                    if (insn.mnemonic == ZYDIS_MNEMONIC_SUB) {
-                        offset = -offset;
-                    }
-                    it->second.accumulated_offset += offset;
-                    
-                    // Debug: print pointer arithmetic adjustment
-                    std::cerr << "Debug: Adjusted pointer in register " << ZydisRegisterGetString(dst_full)
-                              << " by immediate " << offset
-                              << ", resulting offset is " << it->second.accumulated_offset << '\n';
-                }
-            }
+    // Parse Data Directories we care about.
+    if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IAT) {
+        const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+        if (dir.VirtualAddress && dir.Size) {
+            m_iat_va = m_image_base + dir.VirtualAddress;
+            m_iat_end = m_iat_va + dir.Size;
         }
     }
 
-    // Step 3: Clear tracking for registers that are overwritten with non-pointer values
-    for (uint8_t i = 0; i < insn.operand_count; ++i) {
-        const auto& op = operands[i];
-        if (op.type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(op)) {
-            ZydisRegister reg_full = GetFullRegister(op.reg.value);
-            
-            // Skip if this is already handled by mov or arithmetic instructions
-            if (insn.mnemonic != ZYDIS_MNEMONIC_MOV && 
-                insn.mnemonic != ZYDIS_MNEMONIC_ADD && 
-                insn.mnemonic != ZYDIS_MNEMONIC_SUB &&
-                insn.mnemonic != ZYDIS_MNEMONIC_LEA) {
-                // Register is being overwritten with unknown value
-                register_pointer_map.erase(reg_full);
-            }
-        }
+    // Catalog all sections.
+    const auto sections = IMAGE_FIRST_SECTION(nt);
+    m_sections.reserve(nt->FileHeader.NumberOfSections);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        Section s;
+        char name_buf[9]{};
+        memcpy(name_buf, sections[i].Name, 8);
+        s.name = name_buf;
+        s.va_start = m_image_base + sections[i].VirtualAddress;
+        s.va_end = s.va_start + sections[i].Misc.VirtualSize;
+        s.rva_start = sections[i].VirtualAddress;
+        s.rva_end = s.rva_start + sections[i].Misc.VirtualSize;
+        s.raw_ptr = sections[i].PointerToRawData;
+        s.raw_size = sections[i].SizeOfRawData;
+        s.characteristics = sections[i].Characteristics;
+        if (s.characteristics & IMAGE_SCN_CNT_CODE) s.kind = GlobalAccessReport::SectionType::TEXT;
+        else if (s.name == ".rdata") s.kind = GlobalAccessReport::SectionType::RDATA;
+        else if (s.name == ".data") s.kind = GlobalAccessReport::SectionType::DATA;
+        else if (s.name == ".idata") s.kind = GlobalAccessReport::SectionType::IDATA;
+        else if (s.name == ".pdata") s.kind = GlobalAccessReport::SectionType::PDATA;
+        else if (s.name == ".xdata") s.kind = GlobalAccessReport::SectionType::XDATA;
+        else if (s.name == ".rsrc") s.kind = GlobalAccessReport::SectionType::RSRC;
+        else if (s.name == ".tls") s.kind = GlobalAccessReport::SectionType::TLS;
+        else s.kind = GlobalAccessReport::SectionType::OTHER;
+        m_sections.push_back(s);
     }
-    // Step A: detect root global handle ---------------------------------
-    for (uint8_t oi = 0; oi < insn.operand_count; ++oi) {
-        const auto& op = operands[oi];
-        
-        // Debug: Check all RIP-relative accesses
-        if (op.type == ZYDIS_OPERAND_TYPE_MEMORY && op.mem.base == ZYDIS_REGISTER_RIP) {
-            static int debug_count = 0;
-            if (debug_count < 10) {  // Only print first 10 to avoid spam
-                std::cerr << "Debug: RIP-relative at 0x" << std::hex << ip 
-                          << " mnemonic=" << insn.mnemonic 
-                          << " (" << (insn.mnemonic == ZYDIS_MNEMONIC_MOV ? "MOV" : 
-                               insn.mnemonic == ZYDIS_MNEMONIC_LEA ? "LEA" : "OTHER") << ")"
-                          << " operand_idx=" << (int)oi
-                          << " operand_count=" << (int)insn.operand_count
-                          << " actions=0x" << std::hex << (int)op.actions << std::dec
-                          << " IsMovOrLea=" << IsRIPRelativeMovOrLEA(insn, op) << "\n";
-                debug_count++;
-            }
-        }
-        
-        if (!IsRIPRelativeMovOrLEA(insn, op)) continue;
 
-        // absolute address of [RIP+disp]
-        uint64_t glob;
-        ZyanStatus status = ZydisCalcAbsoluteAddress(&insn, &op, ip, &glob);
-        if (ZYAN_FAILED(status)) {
-            static int calc_debug_count = 0;
-            if (calc_debug_count < 5) {
-                std::cerr << "Debug: ZydisCalcAbsoluteAddress failed with status: 0x" 
-                          << std::hex << status << std::dec << "\n";
-                calc_debug_count++;
-            }
-            continue;
-        }
+    // Find the .text section to set up the code view.
+    auto text_sec_it = std::find_if(m_sections.begin(), m_sections.end(), [](const Section& s) {
+        return s.kind == GlobalAccessReport::SectionType::TEXT;
+    });
+    if (text_sec_it == m_sections.end()) throw std::runtime_error(".text section not found");
+    const Section* text_sec = &(*text_sec_it);
+    m_text_va = text_sec->va_start;
+}
 
-        // Debug: Show calculated address
-        static int addr_debug_count = 0;
-        if (addr_debug_count < 5) {
-            std::cerr << "Debug: Calculated global address: 0x" << std::hex << glob 
-                      << " from RIP=0x" << ip << " text_range=[0x" << m_text_va 
-                      << ", 0x" << (m_text_va + m_text.size()) << ")" << std::dec << "\n";
-            addr_debug_count++;
-        }
+// =================================================================================================
+// Pre-decoding
+// =================================================================================================
 
-        // .text self‑references are ignored
-        if (glob >= m_text_va && glob < m_text_va + m_text.size()) continue;
-        
-        // Filter out suspicious addresses that are likely base addresses rather than globals
-        // These are typically addresses below the image base that are used with large offsets
-        // Also check if this is likely the image base minus some offset
-        const uint64_t image_base = m_text_va & 0xFFFFFFFF00000000ULL;  // Typical image base alignment
-        if (glob < image_base || (glob < m_text_va && (m_text_va - glob) > 0x1000)) {
-            // This looks like a base address used for relative addressing
-            // Skip it to avoid false positives
-            static int filter_debug_count = 0;
-            if (filter_debug_count < 5) {
-                std::cerr << "Debug: Filtering out suspicious base address 0x" << std::hex << glob 
-                          << " (image_base=0x" << image_base << ", text_va=0x" << m_text_va << ")" << std::dec << "\n";
-                filter_debug_count++;
-            }
-            continue;
-        }
+void GlobalCallAnalyzer::PredecodeText() const {
+    if (!m_prog.empty()) return; // Already decoded.
 
-        // Track the source of derived pointers when loading from globals
-        for (uint8_t j = 0; j < insn.operand_count; ++j) {
-            const auto& dest_op = operands[j];
-            if (dest_op.type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(dest_op)) {
-                // Mark the register as containing a pointer from this global
-                DereferencedPointer derivedPointer = {
-                    glob,                                    // source_global_va
-                    static_cast<int64_t>(op.mem.disp.value), // source_offset (signed)
-                    GetFullRegister(dest_op.reg.value),      // loaded_register (full register)
-                    idx,                                     // instruction_index
-                    1,                                       // nesting_level
-                    0                                        // accumulated_offset
-                };
-                register_pointer_map[GetFullRegister(dest_op.reg.value)] = derivedPointer;
-            }
-        }
-        // alias set starts with the mov destination
-        ZydisRegister aliases[4]{};
-        uint8_t       alias_cnt = 0;
-        for (uint8_t j = 0; j < insn.operand_count; ++j)
-            if (operands[j].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                OperandWrites(operands[j]))
-                aliases[alias_cnt++] = operands[j].reg.value;
+    const auto* text_sec = FindSectionByVA(m_text_va);
+    if (!text_sec) throw std::logic_error(".text section info disappeared");
 
-        constexpr size_t kWindow = 8;
-        GlobalAccessReport* rep   = nullptr;
-        for (auto& r : reports) if (r.global_va == glob) { rep = &r; break; }
-        if (!rep) { reports.push_back({glob,{}}); rep = &reports.back(); }
+    // Get the correct byte span for the .text section.
+    std::span<const uint8_t> text_bytes;
+    if (m_is_memory_image) {
+        if (text_sec->rva_start + text_sec->rva_end - text_sec->rva_start > m_view.size())
+            throw std::runtime_error(".text RVA range is out of bounds for the provided memory view");
+        text_bytes = m_view.subspan(text_sec->rva_start, text_sec->rva_end - text_sec->rva_start);
+    } else {
+        if (text_sec->raw_ptr + text_sec->raw_size > m_view.size())
+            throw std::runtime_error(".text raw file range is out of bounds for the provided file view");
+        text_bytes = m_view.subspan(text_sec->raw_ptr, text_sec->raw_size);
+    }
 
-        size_t walk_idx = idx + 1;
-        for (size_t w = 0; w < kWindow && walk_idx < m_text.size(); ++w) {
-            ZydisDecodedInstruction nxt{};
-            ZydisDecodedOperand nxt_operands[ZYDIS_MAX_OPERAND_COUNT];
-            ZydisDecoder dec;
-            ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-            if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec,
-                            m_text.data() + walk_idx, m_text.size() - walk_idx,
-                            &nxt, nxt_operands)))
-                break;
+    m_prog.reserve(text_bytes.size() / 4); // Heuristic: average instruction size is ~4 bytes.
 
-            uint64_t nxt_ip = m_text_va + walk_idx;
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
 
-            // Scan operands for accesses using alias registers ------------
-            for (uint8_t oi2 = 0; oi2 < nxt.operand_count; ++oi2) {
-                const auto& op2 = nxt_operands[oi2];
-                if (op2.type != ZYDIS_OPERAND_TYPE_MEMORY) continue;
-
-                for (uint8_t a = 0; a < alias_cnt; ++a) {
-                    if (op2.mem.base != aliases[a]) continue;
-
-                    // compute [alias + disp]
-                    // The displacement is signed, we need to handle it correctly
-                    int64_t signed_disp = op2.mem.disp.value;
-                    
-                    // Debug problematic offsets
-                    static int offset_debug_count = 0;
-                    if (offset_debug_count < 10 && (signed_disp < -100 || signed_disp > 10000)) {
-                        std::cerr << "Debug: Large/negative offset " << signed_disp 
-                                  << " (0x" << std::hex << signed_disp << ") at instruction 0x" 
-                                  << nxt_ip << " mnemonic=" << nxt.mnemonic << std::dec << "\n";
-                        offset_debug_count++;
-                    }
-                    
-                    // Store the offset as a signed value to preserve negative offsets
-                    auto& st = rep->per_offset[signed_disp];
-                    st.relative = signed_disp;
-
-                    // Type inference based on instruction and operand info
-                    size_t operand_size = op2.size / 8;  // Convert bits to bytes
-                    st.type_info.size_histogram[operand_size]++;
-                    
-                    // Check for floating-point operations
-                    bool is_float_op = false;
-                    switch (nxt.mnemonic) {
-                        case ZYDIS_MNEMONIC_MOVSS:
-                        case ZYDIS_MNEMONIC_MOVAPS:
-                        case ZYDIS_MNEMONIC_MOVUPS:
-                        case ZYDIS_MNEMONIC_ADDSS:
-                        case ZYDIS_MNEMONIC_SUBSS:
-                        case ZYDIS_MNEMONIC_MULSS:
-                        case ZYDIS_MNEMONIC_DIVSS:
-                        case ZYDIS_MNEMONIC_COMISS:
-                        case ZYDIS_MNEMONIC_UCOMISS:
-                            st.type_info.has_float_ops = true;
-                            is_float_op = true;
-                            break;
-                        case ZYDIS_MNEMONIC_MOVSD:
-                        case ZYDIS_MNEMONIC_MOVAPD:
-                        case ZYDIS_MNEMONIC_MOVUPD:
-                        case ZYDIS_MNEMONIC_ADDSD:
-                        case ZYDIS_MNEMONIC_SUBSD:
-                        case ZYDIS_MNEMONIC_MULSD:
-                        case ZYDIS_MNEMONIC_DIVSD:
-                        case ZYDIS_MNEMONIC_COMISD:
-                        case ZYDIS_MNEMONIC_UCOMISD:
-                            st.type_info.has_float_ops = true;
-                            is_float_op = true;
-                            break;
-                    }
-
-                    if (nxt.mnemonic == ZYDIS_MNEMONIC_CALL) {
-                        ++st.call_hits;
-                        st.type_info.has_calls = true;
-                    }
-                    else if (OperandReads(op2) && OperandWrites(op2))
-                        ; // ignore RMW – classify separately if needed
-                    else if (OperandReads(op2))
-                        ++st.load_hits;
-                    else if (OperandWrites(op2))
-                        ++st.store_hits;
-                }
-            }
-
-            // alias propagation + kill ------------------------------------
-            for (uint8_t oi2 = 0; oi2 < nxt.operand_count; ++oi2) {
-                const auto& op2 = nxt_operands[oi2];
-                if (op2.type != ZYDIS_OPERAND_TYPE_REGISTER) continue;
-
-                // transfer rX  rY
-                if (OperandReads(op2) && op2.reg.value == aliases[0]) {
-                    for (uint8_t oi3 = 0; oi3 < nxt.operand_count; ++oi3) {
-                        const auto& dst = nxt_operands[oi3];
-                        if (OperandWrites(dst) && dst.type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                            alias_cnt < std::size(aliases))
-                            aliases[alias_cnt++] = dst.reg.value;
-                    }
-                }
-                // kill
-                if (OperandWrites(op2)) {
-                    for (uint8_t a = 0; a < alias_cnt; ++a)
-                        if (aliases[a] == op2.reg.value) { aliases[a] = ZYDIS_REGISTER_NONE; }
-                }
-            }
-
-            // stop if alias set empty
-            bool empty = true;
-            for (uint8_t a = 0; a < alias_cnt; ++a) if (aliases[a] != ZYDIS_REGISTER_NONE) { empty = false; break; }
-            if (empty) break;
-
-            // stop on flow break that we are not going to simulate
-            if (nxt.mnemonic == ZYDIS_MNEMONIC_CALL || nxt.mnemonic == ZYDIS_MNEMONIC_RET)
-                break;
-
-            walk_idx += nxt.length;
+    size_t offset = 0;
+    while (offset < text_bytes.size()) {
+        DecodedInstr di;
+        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, text_bytes.data() + offset, text_bytes.size() - offset, &di.insn, di.ops.data()))) {
+            di.ip = m_text_va + offset;
+            di.length = di.insn.length;
+            m_prog.push_back(di);
+            offset += di.length;
+        } else {
+            offset++; // Skip undecodable byte.
         }
     }
 }
 
-// ------------------------------------------------------------------
+// =================================================================================================
+// Core Analysis
+// =================================================================================================
 
 std::vector<GlobalAccessReport> GlobalCallAnalyzer::Analyze() const {
-    ZydisDecoder dec;
-    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    PredecodeText();
 
-    std::vector<GlobalAccessReport> reports;
-    std::unordered_map<ZydisRegister, DereferencedPointer> register_pointer_map;
-    size_t off = 0;
-    size_t instruction_count = 0;
-    size_t rip_relative_count = 0;
-    
-    while (off < m_text.size()) {
-        ZydisDecodedInstruction insn{};
-        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-        if (ZYAN_FAILED(ZydisDecoderDecodeFull(&dec,
-                 m_text.data() + off, m_text.size() - off, &insn, operands)))
-            { ++off; continue; }  // undecodable byte – advance
+    // 1. Discover all potential "root" instructions.
+    // A root is an instruction that loads a global address via [RIP+disp].
+    std::vector<size_t> root_indices;
+    for (size_t i = 0; i < m_prog.size(); ++i) {
+        const auto& di = m_prog[i];
+        if (di.insn.mnemonic != ZYDIS_MNEMONIC_MOV && di.insn.mnemonic != ZYDIS_MNEMONIC_LEA) continue;
 
-        const uint64_t ip = m_text_va + off;
-        instruction_count++;
-        
-        // Count RIP-relative instructions for debugging
-        for (uint8_t i = 0; i < insn.operand_count; ++i) {
-            if (operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY && 
-                operands[i].mem.base == ZYDIS_REGISTER_RIP) {
-                rip_relative_count++;
-                break;
+        for (uint8_t j = 0; j < di.insn.operand_count; ++j) {
+            const auto& op = di.ops[j];
+            if (op.type == ZYDIS_OPERAND_TYPE_MEMORY && op.mem.base == ZYDIS_REGISTER_RIP) {
+                uint64_t global_va;
+                if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&di.insn, &op, di.ip, &global_va))) {
+                    const auto* section = FindSectionByVA(global_va);
+                    if (section && section->kind != GlobalAccessReport::SectionType::TEXT) {
+                        root_indices.push_back(i);
+                        break; // Process this instruction once.
+                    }
+                }
             }
         }
-        
-        ProcessInstruction(off, ip, insn, operands, reports, register_pointer_map);
-        off += insn.length;
     }
-    
-    std::cerr << "Debug: Analyzed " << instruction_count << " instructions\n";
-    std::cerr << "Debug: Found " << rip_relative_count << " RIP-relative instructions\n";
-    std::cerr << "Debug: .text section VA: 0x" << std::hex << m_text_va 
-              << ", size: 0x" << m_text.size() << std::dec << "\n";
-    
-    return reports;
+
+    // 2. Process each root in parallel to generate partial reports.
+    std::vector<std::unordered_map<uint64_t, GlobalAccessReport>> partial_reports(std::thread::hardware_concurrency());
+
+#if GCA_ENABLE_PAR
+    std::mutex partial_reports_mutex;
+    std::for_each(std::execution::par, root_indices.begin(), root_indices.end(), [&](size_t root_idx) {
+        std::unordered_map<uint64_t, GlobalAccessReport> thread_local_reports;
+        ProcessRoot(root_idx, m_prog[root_idx], thread_local_reports);
+
+        // Merge thread-local results into the global partials.
+        std::scoped_lock lock(partial_reports_mutex);
+        for (auto& [va, report] : thread_local_reports) {
+            // A simple round-robin distribution to a partial report bucket.
+            auto& target_report = partial_reports[va % partial_reports.size()][va];
+            if (target_report.global_va == 0) {
+                target_report = std::move(report);
+            } else {
+                // This case is rare but possible if two threads process roots pointing to the same global.
+                // A full merge logic would be needed here, but for now, we just combine offsets.
+                for(auto& [offset, stats] : report.per_offset) {
+                    target_report.per_offset[offset].load_hits += stats.load_hits;
+                    target_report.per_offset[offset].store_hits += stats.store_hits;
+                    target_report.per_offset[offset].call_hits += stats.call_hits;
+                }
+            }
+        }
+    });
+#else
+    // Serial execution fallback.
+    for (size_t root_idx : root_indices) {
+        ProcessRoot(root_idx, m_prog[root_idx], partial_reports[0]);
+    }
+#endif
+
+    // 3. Merge all partial reports into a final report map.
+    std::unordered_map<uint64_t, GlobalAccessReport> final_reports_map;
+    for (const auto& partial : partial_reports) {
+        for (const auto& [va, report] : partial) {
+            auto& target_report = final_reports_map[va];
+            if (target_report.global_va == 0) {
+                target_report = report;
+            } else {
+                for(auto& [offset, stats] : report.per_offset) {
+                    target_report.per_offset[offset].load_hits += stats.load_hits;
+                    target_report.per_offset[offset].store_hits += stats.store_hits;
+                    target_report.per_offset[offset].call_hits += stats.call_hits;
+                    // A full merge would also combine TypeInfo and nested accesses.
+                }
+            }
+        }
+    }
+
+    // 4. Apply final enrichment and convert to a sorted vector.
+    std::vector<GlobalAccessReport> final_reports;
+    final_reports.reserve(final_reports_map.size());
+    for (auto& [va, report] : final_reports_map) {
+        // The `was_from_lea` flag is lost in the parallel merge; a more complex Root object would be needed.
+        // For now, we pass false.
+        EnrichReport(report, false);
+        final_reports.push_back(std::move(report));
+    }
+
+    std::sort(final_reports.begin(), final_reports.end(), [](const auto& a, const auto& b) {
+        return a.global_va < b.global_va;
+    });
+
+    return final_reports;
 }
 
-// Infer the type based on collected stats
-InferredType GlobalCallAnalyzer::InferTypeFromStats(const OffsetStats& stats) {
-    if (stats.type_info.has_calls) {
-        return InferredType::FUNCTION_POINTER;
+void GlobalCallAnalyzer::ProcessRoot(size_t root_idx, const DecodedInstr& root_di,
+                                     std::unordered_map<uint64_t, GlobalAccessReport>& reports) const {
+
+    uint64_t global_va = 0;
+    bool was_from_lea = (root_di.insn.mnemonic == ZYDIS_MNEMONIC_LEA);
+    ZydisRegister root_dest_reg = ZYDIS_REGISTER_NONE;
+
+    // Find the RIP-relative operand and the destination register.
+    for (uint8_t i = 0; i < root_di.insn.operand_count; ++i) {
+        const auto& op = root_di.ops[i];
+        if (op.type == ZYDIS_OPERAND_TYPE_MEMORY && op.mem.base == ZYDIS_REGISTER_RIP) {
+            ZydisCalcAbsoluteAddress(&root_di.insn, &op, root_di.ip, &global_va);
+        }
+        if (op.type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(op)) {
+            root_dest_reg = GetFullRegister(op.reg.value);
+        }
     }
+
+    if (global_va == 0 || root_dest_reg == ZYDIS_REGISTER_NONE) return;
+
+    // Initialize state for this window walk.
+    RegisterState reg_state;
+    reg_state[root_dest_reg] = TrackedPointer{global_va, {}, 0};
+
+    auto& report = reports[global_va];
+    if (report.global_va == 0) report.global_va = global_va;
+
+    // Analyze a fixed window of instructions following the root.
+    constexpr size_t ANALYSIS_WINDOW = 64;
+    for (size_t i = root_idx + 1; i < std::min(m_prog.size(), root_idx + 1 + ANALYSIS_WINDOW); ++i) {
+        const auto& di = m_prog[i];
+
+        // Handle memory operands that use a tracked register.
+        for (uint8_t j = 0; j < di.insn.operand_count; ++j) {
+            const auto& op = di.ops[j];
+            if (op.type != ZYDIS_OPERAND_TYPE_MEMORY || op.mem.base == ZYDIS_REGISTER_NONE) continue;
+
+            auto it = reg_state.find(GetFullRegister(op.mem.base));
+            if (it != reg_state.end()) {
+                const auto& ptr = it->second;
+                int64_t final_offset = ptr.accumulated_offset + op.mem.disp.value;
+                RecordAccess(report, ptr.path, final_offset, di.insn, op);
+
+                // If this is a load of a new pointer, create a new tracked pointer.
+                if (di.insn.mnemonic == ZYDIS_MNEMONIC_MOV && op.size == 64 && OperandReads(op)) {
+                    for (uint8_t k = 0; k < di.insn.operand_count; ++k) {
+                        const auto& dst_op = di.ops[k];
+                        if (dst_op.type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(dst_op)) {
+                            TrackedPointer new_ptr = ptr;
+                            new_ptr.path.push_back(final_offset);
+                            new_ptr.accumulated_offset = 0;
+                            reg_state[GetFullRegister(dst_op.reg.value)] = new_ptr;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle state changes: aliasing, arithmetic, and kills.
+        bool is_state_modifying_op = false;
+        if (di.insn.mnemonic == ZYDIS_MNEMONIC_MOV && di.insn.operand_count >= 2) {
+            const auto& dst = di.ops[0];
+            const auto& src = di.ops[1];
+            if (dst.type == ZYDIS_OPERAND_TYPE_REGISTER && src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                auto it = reg_state.find(GetFullRegister(src.reg.value));
+                if (it != reg_state.end()) {
+                    reg_state[GetFullRegister(dst.reg.value)] = it->second;
+                } else {
+                    reg_state.erase(GetFullRegister(dst.reg.value));
+                }
+                is_state_modifying_op = true;
+            }
+        } else if (di.insn.mnemonic == ZYDIS_MNEMONIC_ADD || di.insn.mnemonic == ZYDIS_MNEMONIC_SUB) {
+            const auto& dst = di.ops[0];
+            const auto& src = di.ops[1];
+            if (dst.type == ZYDIS_OPERAND_TYPE_REGISTER && src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                auto it = reg_state.find(GetFullRegister(dst.reg.value));
+                if (it != reg_state.end()) {
+                    int64_t offset = src.imm.value.s;
+                    if (di.insn.mnemonic == ZYDIS_MNEMONIC_SUB) offset = -offset;
+                    it->second.accumulated_offset += offset;
+                    is_state_modifying_op = true;
+                }
+            }
+        }
+
+        // Kill state for any register that is written by an unhandled operation.
+        if (!is_state_modifying_op) {
+            for (uint8_t j = 0; j < di.insn.operand_count; ++j) {
+                const auto& op = di.ops[j];
+                if (op.type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(op)) {
+                    reg_state.erase(GetFullRegister(op.reg.value));
+                }
+            }
+        }
+
+        // Handle control flow.
+        if (di.insn.meta.category == ZYDIS_CATEGORY_RET || di.insn.meta.category == ZYDIS_CATEGORY_COND_BR) {
+            break; // End of basic block, stop analysis for this window.
+        }
+        if (di.insn.mnemonic == ZYDIS_MNEMONIC_CALL) {
+            // Per x64 ABI, clear volatile registers.
+            reg_state.erase(ZYDIS_REGISTER_RAX);
+            reg_state.erase(ZYDIS_REGISTER_RCX);
+            reg_state.erase(ZYDIS_REGISTER_RDX);
+            reg_state.erase(ZYDIS_REGISTER_R8);
+            reg_state.erase(ZYDIS_REGISTER_R9);
+            reg_state.erase(ZYDIS_REGISTER_R10);
+            reg_state.erase(ZYDIS_REGISTER_R11);
+        }
+    }
+}
+
+// =================================================================================================
+// Heuristics and Classification
+// =================================================================================================
+
+const GlobalCallAnalyzer::Section* GlobalCallAnalyzer::FindSectionByVA(uint64_t va) const {
+    for (const auto& s : m_sections) {
+        if (va >= s.va_start && va < s.va_end) return &s;
+    }
+    return nullptr;
+}
+
+std::span<const uint8_t> GlobalCallAnalyzer::SpanForVA(uint64_t va, size_t size) const {
+    const auto* section = FindSectionByVA(va);
+    if (!section) return {};
+
+    uint64_t offset_in_section = va - section->va_start;
+    uint32_t base_offset = m_is_memory_image ? section->rva_start : section->raw_ptr;
+    uint32_t section_size = m_is_memory_image ? (section->rva_end - section->rva_start) : section->raw_size;
+
+    if (offset_in_section + size > section_size) return {};
+    if (base_offset + offset_in_section + size > m_view.size()) return {};
+
+    return m_view.subspan(base_offset + offset_in_section, size);
+}
+
+void GlobalCallAnalyzer::EnrichReport(GlobalAccessReport& report, bool was_from_lea) const {
+    const auto* section = FindSectionByVA(report.global_va);
+    if (section) {
+        report.section_name = section->name;
+        report.section_type = section->kind;
+    }
+    report.is_in_iat = (report.global_va >= m_iat_va && report.global_va < m_iat_end);
+
+    if (report.section_type == GlobalAccessReport::SectionType::RDATA) {
+        if (was_from_lea && LooksLikeAscii(report.global_va, report.string_preview)) {
+            report.likely_string = true;
+        } else if (LooksLikeVTable(report.global_va)) {
+            report.likely_vtable = true;
+        }
+    }
+}
+
+bool GlobalCallAnalyzer::LooksLikeVTable(uint64_t va) const {
+    auto view = SpanForVA(va, 8 * sizeof(uint64_t)); // Check first 8 potential entries.
+    if (view.size() < sizeof(uint64_t)) return false;
+
+    int code_pointers = 0;
+    for (size_t i = 0; i < view.size() / sizeof(uint64_t); ++i) {
+        uint64_t entry_va;
+        memcpy(&entry_va, view.data() + i * sizeof(uint64_t), sizeof(uint64_t));
+        const auto* section = FindSectionByVA(entry_va);
+        if (section && section->kind == GlobalAccessReport::SectionType::TEXT) {
+            code_pointers++;
+        }
+    }
+    return code_pointers >= 3; // Heuristic: at least 3 pointers into .text section.
+}
+
+bool GlobalCallAnalyzer::LooksLikeAscii(uint64_t va, std::string& out_preview) const {
+    auto view = SpanForVA(va, 128); // Check up to 128 bytes.
+    if (view.empty()) return false;
+
+    size_t printable_chars = 0;
+    size_t len = 0;
+    for (uint8_t c : view) {
+        if (c == 0) break;
+        len++;
+        if (isprint(c) || isspace(c)) {
+            printable_chars++;
+        }
+    }
+
+    if (len == 0 || len == view.size()) return false; // Not null-terminated or empty.
+    if (static_cast<double>(printable_chars) / len < 0.85) return false; // Must be mostly printable.
+
+    out_preview.assign(reinterpret_cast<const char*>(view.data()), std::min<size_t>(len, 64));
+    return true;
+}
+
+// =================================================================================================
+// Public Static Helpers
+// =================================================================================================
+
+InferredType GlobalCallAnalyzer::InferTypeFromStats(const OffsetStats& stats) {
+    if (stats.type_info.has_calls) return InferredType::FUNCTION_POINTER;
     if (stats.type_info.has_float_ops) {
-        if (stats.type_info.size_histogram.count(4)) {
-            return InferredType::FLOAT;
-        }
-        if (stats.type_info.size_histogram.count(8)) {
-            return InferredType::DOUBLE;
-        }
+        if (stats.type_info.size_histogram.count(8)) return InferredType::DOUBLE;
+        if (stats.type_info.size_histogram.count(4)) return InferredType::FLOAT;
     }
     if (stats.type_info.size_histogram.size() == 1) {
         const auto size = stats.type_info.size_histogram.begin()->first;
@@ -547,24 +526,16 @@ InferredType GlobalCallAnalyzer::InferTypeFromStats(const OffsetStats& stats) {
             case 8: return InferredType::QWORD;
         }
     }
-    if (stats.type_info.size_histogram.count(8)) {
-        return InferredType::POINTER;
-    }
-    return InferredType::STRUCT;  // Default to complex type
+    if (stats.type_info.size_histogram.count(8)) return InferredType::POINTER;
+    return InferredType::STRUCT;
 }
 
-// Overload for NestedAccess - uses the same logic since it has the same relevant fields
 InferredType GlobalCallAnalyzer::InferTypeFromStats(const NestedAccess& nested) {
-    if (nested.type_info.has_calls) {
-        return InferredType::FUNCTION_POINTER;
-    }
+    // This can be simplified by having a common stats structure.
+    if (nested.type_info.has_calls) return InferredType::FUNCTION_POINTER;
     if (nested.type_info.has_float_ops) {
-        if (nested.type_info.size_histogram.count(4)) {
-            return InferredType::FLOAT;
-        }
-        if (nested.type_info.size_histogram.count(8)) {
-            return InferredType::DOUBLE;
-        }
+        if (nested.type_info.size_histogram.count(8)) return InferredType::DOUBLE;
+        if (nested.type_info.size_histogram.count(4)) return InferredType::FLOAT;
     }
     if (nested.type_info.size_histogram.size() == 1) {
         const auto size = nested.type_info.size_histogram.begin()->first;
@@ -575,10 +546,8 @@ InferredType GlobalCallAnalyzer::InferTypeFromStats(const NestedAccess& nested) 
             case 8: return InferredType::QWORD;
         }
     }
-    if (nested.type_info.size_histogram.count(8)) {
-        return InferredType::POINTER;
-    }
-    return InferredType::STRUCT;  // Default to complex type
+    if (nested.type_info.size_histogram.count(8)) return InferredType::POINTER;
+    return InferredType::STRUCT;
 }
 
 const char* GlobalCallAnalyzer::TypeToString(InferredType type) {
@@ -591,11 +560,10 @@ const char* GlobalCallAnalyzer::TypeToString(InferredType type) {
         case InferredType::POINTER: return "Pointer";
         case InferredType::FLOAT: return "Float";
         case InferredType::DOUBLE: return "Double";
-        case InferredType::FUNCTION_POINTER: return "Function Pointer";
+        case InferredType::FUNCTION_POINTER: return "Function Ptr";
         case InferredType::STRUCT: return "Struct";
     }
     return "Unknown";
 }
 
 } // namespace BinA
-

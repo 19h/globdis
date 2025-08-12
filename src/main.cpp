@@ -5,172 +5,172 @@
 #include <fstream>
 #include <vector>
 #include <string>
-#include <map>
-#include <sstream>
 #include <iomanip>
 #include <functional>
+#include <chrono>
+#include <algorithm>
+
+// Helper to sort map keys for consistent, deterministic output.
+template <typename K, typename V>
+std::vector<K> get_sorted_keys(const std::unordered_map<K, V>& umap) {
+    std::vector<K> keys;
+    keys.reserve(umap.size());
+    for (const auto& [key, val] : umap) {
+        keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+    return keys;
+}
+
+// A helper class to memory-map a file for efficient read-only access.
+class MemoryMappedFile {
+public:
+    MemoryMappedFile(const char* path) {
+        m_file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (m_file == INVALID_HANDLE_VALUE) throw std::runtime_error("Failed to open file");
+
+        LARGE_INTEGER file_size;
+        if (!GetFileSizeEx(m_file, &file_size)) {
+            CloseHandle(m_file);
+            throw std::runtime_error("Failed to get file size");
+        }
+        m_size = file_size.QuadPart;
+
+        m_mapping = CreateFileMappingA(m_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!m_mapping) {
+            CloseHandle(m_file);
+            throw std::runtime_error("Failed to create file mapping");
+        }
+
+        m_view = MapViewOfFile(m_mapping, FILE_MAP_READ, 0, 0, 0);
+        if (!m_view) {
+            CloseHandle(m_mapping);
+            CloseHandle(m_file);
+            throw std::runtime_error("Failed to map view of file");
+        }
+    }
+
+    ~MemoryMappedFile() {
+        if (m_view) UnmapViewOfFile(m_view);
+        if (m_mapping) CloseHandle(m_mapping);
+        if (m_file != INVALID_HANDLE_VALUE) CloseHandle(m_file);
+    }
+
+    std::span<const uint8_t> GetView() const {
+        return {static_cast<const uint8_t*>(m_view), static_cast<size_t>(m_size)};
+    }
+
+private:
+    HANDLE m_file = INVALID_HANDLE_VALUE;
+    HANDLE m_mapping = nullptr;
+    void* m_view = nullptr;
+    uint64_t m_size = 0;
+};
+
+void PrintReports(const std::string& label, const std::vector<BinA::GlobalAccessReport>& reports) {
+    std::cout << "Analyzing: " << label << "\n";
+    std::cout << "Found " << reports.size() << " global variable references\n\n";
+
+    for (const auto& r : reports) {
+        std::cout << "GLOBAL 0x" << std::hex << r.global_va << std::dec;
+        if (!r.section_name.empty()) std::cout << " (" << r.section_name << ")";
+        if (r.is_in_iat) std::cout << " [IAT]";
+        if (r.likely_vtable) std::cout << " [VTABLE]";
+        if (r.likely_jump_table) std::cout << " [JUMP TABLE]";
+        if (r.likely_string) std::cout << " [STRING: \"" << r.string_preview << "\"]";
+        std::cout << '\n';
+
+        for (const auto& offset : get_sorted_keys(r.per_offset)) {
+            const auto& st = r.per_offset.at(offset);
+            auto inferred_type = BinA::GlobalCallAnalyzer::InferTypeFromStats(st);
+
+            std::cout << "  " << (offset < 0 ? "[-0x" : "[+0x") << std::hex << (offset < 0 ? -offset : offset) << "] ";
+            std::cout << std::left << std::setw(14) << BinA::GlobalCallAnalyzer::TypeToString(inferred_type);
+            std::cout << " calls=" << std::dec << st.call_hits
+                      << ", loads=" << st.load_hits
+                      << ", stores=" << st.store_hits;
+
+            if (st.type_info.size_histogram.size() > 1) {
+                std::cout << ", sizes={";
+                bool first = true;
+                for (const auto& [size, count] : st.type_info.size_histogram) {
+                    if (!first) std::cout << ", ";
+                    std::cout << size << "B:" << count;
+                    first = false;
+                }
+                std::cout << "}";
+            }
+            std::cout << '\n';
+
+            if (!st.nested_accesses.empty()) {
+                std::function<void(const std::unordered_map<int64_t, BinA::NestedAccess>&, const std::string&)> displayNested;
+                displayNested = [&](const auto& nestedMap, const std::string& prefix) {
+                    auto nested_keys = get_sorted_keys(nestedMap);
+                    for (size_t i = 0; i < nested_keys.size(); ++i) {
+                        const auto& nrel = nested_keys[i];
+                        const auto& nst = nestedMap.at(nrel);
+                        bool isLast = (i == nested_keys.size() - 1);
+
+                        std::cout << prefix << (isLast ? "└── " : "├── ");
+                        std::cout << (nrel < 0 ? "[-0x" : "[+0x") << std::hex << (nrel < 0 ? -nrel : nrel) << "] ";
+                        std::cout << std::left << std::setw(14) << BinA::GlobalCallAnalyzer::TypeToString(BinA::GlobalCallAnalyzer::InferTypeFromStats(nst));
+                        std::cout << " calls=" << std::dec << nst.call_hits << ", loads=" << nst.load_hits << ", stores=" << nst.store_hits << '\n';
+
+                        if (!nst.nested_accesses.empty()) {
+                            displayNested(nst.nested_accesses, prefix + (isLast ? "    " : "│   "));
+                        }
+                    }
+                };
+                displayNested(st.nested_accesses, "      ");
+            }
+        }
+        std::cout << '\n';
+    }
+}
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <PE_file_path>\n";
-        std::cerr << "   or: " << argv[0] << " --loaded <module_name>\n";
+        std::cerr << "Usage:\n"
+                  << "  " << argv[0] << " <PE_file_path>\n"
+                  << "  " << argv[0] << " --loaded <module_name>\n";
         return 1;
     }
 
-    std::vector<uint8_t> file_data;
-    
-    if (std::string(argv[1]) == "--loaded" && argc >= 3) {
-        // Original behavior: analyze already loaded module
-        HMODULE mod = GetModuleHandleA(argv[2]);
-        if (!mod) { 
-            std::cerr << "Module '" << argv[2] << "' not loaded\n"; 
-            return 1; 
-        }
+    try {
+        auto start_time = std::chrono::high_resolution_clock::now();
+        std::vector<BinA::GlobalAccessReport> reports;
+        std::string label;
 
-        MODULEINFO mi{};
-        GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi));
+        if (std::string(argv[1]) == "--loaded" && argc >= 3) {
+            label = std::string(argv[2]) + " (loaded)";
+            HMODULE mod = GetModuleHandleA(argv[2]);
+            if (!mod) throw std::runtime_error("Module not loaded: " + std::string(argv[2]));
 
-        std::span<const uint8_t> view(
-            reinterpret_cast<const uint8_t*>(mi.lpBaseOfDll),
-            mi.SizeOfImage);
-
-        BinA::GlobalCallAnalyzer gca(view);
-        auto reports = gca.Analyze();
-
-        for (const auto& r : reports) {
-            std::cout << "GLOBAL 0x" << std::hex << r.global_va << '\n';
-            for (const auto& [rel, st] : r.per_offset) {
-                // Display signed offset properly
-                if (rel < 0) {
-                    std::cout << "  [-0x" << std::hex << -rel << "]  ";
-                } else {
-                    std::cout << "  [+0x" << std::hex << rel << "]  ";
-                }
-                std::cout << "calls="  << st.call_hits
-                          << "  loads=" << st.load_hits
-                          << "  stores="<< st.store_hits << '\n';
+            MODULEINFO mi{};
+            if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi))) {
+                throw std::runtime_error("GetModuleInformation failed");
             }
-        }
-    } else {
-        // New behavior: analyze PE file from disk
-        std::ifstream file(argv[1], std::ios::binary | std::ios::ate);
-        if (!file) {
-            std::cerr << "Failed to open file: " << argv[1] << "\n";
-            return 1;
-        }
-
-        std::streamsize size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        file_data.resize(size);
-        if (!file.read(reinterpret_cast<char*>(file_data.data()), size)) {
-            std::cerr << "Failed to read file: " << argv[1] << "\n";
-            return 1;
+            std::span<const uint8_t> view(reinterpret_cast<const uint8_t*>(mi.lpBaseOfDll), mi.SizeOfImage);
+            BinA::GlobalCallAnalyzer gca(view, true);
+            reports = gca.Analyze();
+        } else {
+            label = argv[1];
+            MemoryMappedFile mmf(argv[1]);
+            BinA::GlobalCallAnalyzer gca(mmf.GetView(), false);
+            reports = gca.Analyze();
         }
 
-        std::span<const uint8_t> view(file_data);
-        
-        try {
-            BinA::GlobalCallAnalyzer gca(view);
-            auto reports = gca.Analyze();
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
 
-            std::cout << "Analyzing: " << argv[1] << "\n";
-            std::cout << "Found " << reports.size() << " global references\n\n";
+        PrintReports(label, reports);
+        std::cout << "--------------------------------------------------\n";
+        std::cout << "Analysis completed in " << duration.count() << " ms.\n";
 
-            for (const auto& r : reports) {
-                std::cout << "GLOBAL 0x" << std::hex << r.global_va << '\n';
-                for (const auto& [rel, st] : r.per_offset) {
-                    auto inferred_type = BinA::GlobalCallAnalyzer::InferTypeFromStats(st);
-                    // Display signed offset properly
-                    if (rel < 0) {
-                        std::cout << "  [-0x" << std::hex << -rel << "]  ";
-                    } else {
-                        std::cout << "  [+0x" << std::hex << rel << "]  ";
-                    }
-                    std::cout << "type=" << BinA::GlobalCallAnalyzer::TypeToString(inferred_type)
-                              << "  calls="  << st.call_hits
-                              << "  loads=" << st.load_hits
-                              << "  stores="<< st.store_hits;
-                    
-                    // Show size histogram if multiple sizes detected
-                    if (st.type_info.size_histogram.size() > 1) {
-                        std::cout << "  sizes={";
-                        bool first = true;
-                        for (const auto& [size, count] : st.type_info.size_histogram) {
-                            if (!first) std::cout << ", ";
-                            std::cout << size << "B:" << count;
-                            first = false;
-                        }
-                        std::cout << "}";
-                    }
-                    std::cout << '\n';
-                    
-                    // Display nested accesses with tree-like visualization
-                    if (!st.nested_accesses.empty()) {
-                        // Define recursive lambda to display nested accesses
-                        std::function<void(const std::unordered_map<int64_t, BinA::NestedAccess>&, 
-                                           const std::string&, bool)> displayNested;
-                        displayNested = [&](const std::unordered_map<int64_t, BinA::NestedAccess>& nestedMap, 
-                                            const std::string& prefix, bool isLast) {
-                            size_t idx = 0;
-                            for (const auto& [nrel, nst] : nestedMap) {
-                                bool lastItem = (++idx == nestedMap.size());
-                                
-                                // Tree visualization
-                                std::cout << prefix;
-                                if (isLast) {
-                                    std::cout << "    ";
-                                } else {
-                                    std::cout << "│   ";
-                                }
-                                std::cout << (lastItem ? "└── " : "├── ");
-                                
-                                // Display nested offset
-                                if (nrel < 0) {
-                                    std::cout << "[-0x" << std::hex << -nrel << "] ";
-                                } else {
-                                    std::cout << "[+0x" << std::hex << nrel << "] ";
-                                }
-                                
-                                // Display type and access stats
-                                std::cout << "type=" << BinA::GlobalCallAnalyzer::TypeToString(
-                                                BinA::GlobalCallAnalyzer::InferTypeFromStats(nst))
-                                          << " -> ";
-                                
-                                if (nst.call_hits > 0) {
-                                    std::cout << "calls=" << std::dec << nst.call_hits << " ";
-                                }
-                                if (nst.load_hits > 0) {
-                                    std::cout << "loads=" << std::dec << nst.load_hits << " ";
-                                }
-                                if (nst.store_hits > 0) {
-                                    std::cout << "stores=" << std::dec << nst.store_hits << " ";
-                                }
-                                
-                                // Show pattern frequency
-                                size_t totalAccesses = nst.call_hits + nst.load_hits + nst.store_hits;
-                                std::cout << "(" << std::dec << totalAccesses << " total accesses)";
-                                std::cout << '\n';
-                                
-                                // Recursively display deeper nests if they exist
-                                if (!nst.nested_accesses.empty()) {
-                                    std::string newPrefix = prefix + (isLast ? "    " : "│   ");
-                                    displayNested(nst.nested_accesses, newPrefix, lastItem);
-                                }
-                            }
-                        };
-                        
-                        // Start displaying nested accesses
-                        displayNested(st.nested_accesses, "  ", false);
-                    }
-                }
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Error analyzing file: " << e.what() << "\n";
-            return 1;
-        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
     }
-    
+
     return 0;
 }
-
