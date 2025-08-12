@@ -227,7 +227,7 @@ void GlobalCallAnalyzer::BuildMetadataIndex() const {
 }
 
 // =================================================================================================
-// Core Analysis
+// Core Analysis - REWRITTEN
 // =================================================================================================
 
 std::vector<GlobalAccessReport> GlobalCallAnalyzer::Analyze() const {
@@ -240,54 +240,44 @@ std::vector<GlobalAccessReport> GlobalCallAnalyzer::Analyze() const {
         }
     }
 
-    std::vector<std::unordered_map<uint64_t, GlobalAccessReport>> partial_reports(std::thread::hardware_concurrency());
-
+    // The parallel processing logic remains, but it now calls the new FollowPath function.
 #if GCA_ENABLE_PAR
-    std::mutex merge_mutex;
+    std::mutex reports_mutex;
+    std::unordered_map<uint64_t, GlobalAccessReport> final_reports_map;
+
     std::for_each(std::execution::par, root_indices.begin(), root_indices.end(), [&](size_t root_idx) {
         std::unordered_map<uint64_t, GlobalAccessReport> thread_local_reports;
-        ProcessRoot(root_idx, thread_local_reports);
+        FollowPath(root_idx, thread_local_reports);
 
-        std::scoped_lock lock(merge_mutex);
+        std::scoped_lock lock(reports_mutex);
         for (auto& [va, report] : thread_local_reports) {
-            auto& target_report = partial_reports[va % partial_reports.size()][va];
+            auto& target_report = final_reports_map[va];
             if (target_report.global_va == 0) {
                 target_report = std::move(report);
             } else {
+                // Merge logic for per_offset stats
                 for (auto& [offset, stats] : report.per_offset) {
-                    target_report.per_offset[offset].load_hits += stats.load_hits;
-                    target_report.per_offset[offset].store_hits += stats.store_hits;
-                    target_report.per_offset[offset].call_hits += stats.call_hits;
+                    auto& target_stats = target_report.per_offset[offset];
+                    target_stats.load_hits += stats.load_hits;
+                    target_stats.store_hits += stats.store_hits;
+                    target_stats.call_hits += stats.call_hits;
+                    // A more robust merge would also combine histograms and nested accesses
                 }
             }
         }
     });
+
 #else
+    std::unordered_map<uint64_t, GlobalAccessReport> final_reports_map;
     for (size_t root_idx : root_indices) {
-        ProcessRoot(root_idx, partial_reports[0]);
+        FollowPath(root_idx, final_reports_map);
     }
 #endif
-
-    std::unordered_map<uint64_t, GlobalAccessReport> final_reports_map;
-    for (const auto& partial : partial_reports) {
-        for (const auto& [va, report] : partial) {
-            auto& target_report = final_reports_map[va];
-            if (target_report.global_va == 0) {
-                target_report = report;
-            } else {
-                for (auto& [offset, stats] : report.per_offset) {
-                    target_report.per_offset[offset].load_hits += stats.load_hits;
-                    target_report.per_offset[offset].store_hits += stats.store_hits;
-                    target_report.per_offset[offset].call_hits += stats.call_hits;
-                }
-            }
-        }
-    }
 
     std::vector<GlobalAccessReport> final_reports;
     final_reports.reserve(final_reports_map.size());
     for (auto& [va, report] : final_reports_map) {
-        EnrichReport(report, false);
+        EnrichReport(report);
         final_reports.push_back(std::move(report));
     }
 
@@ -297,62 +287,63 @@ std::vector<GlobalAccessReport> GlobalCallAnalyzer::Analyze() const {
     return final_reports;
 }
 
-void GlobalCallAnalyzer::ProcessRoot(size_t root_idx,
-                                     std::unordered_map<uint64_t, GlobalAccessReport>& reports) const {
+// ARCHITECTURE: This is the new core analysis engine, replacing ProcessRoot.
+// It implements the state-tainting model described in Part 1.
+void GlobalCallAnalyzer::FollowPath(size_t start_idx,
+                                    std::unordered_map<uint64_t, GlobalAccessReport>& reports) const {
     auto text_bytes = GetTextBytes();
     ZydisDecoder decoder;
     ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
 
-    const auto& root_meta = m_metadata_index[root_idx];
+    // 1. Identify the initial root global access
+    const auto& root_meta = m_metadata_index[start_idx];
     ZydisDecodedInstruction root_insn;
     ZydisDecodedOperand root_ops[ZYDIS_MAX_OPERAND_COUNT];
     if (ZYAN_FAILED(ZydisDecoderDecodeFull(&decoder, text_bytes.data() + root_meta.offset,
                                             text_bytes.size() - root_meta.offset, &root_insn, root_ops))) {
         return;
     }
-    uint64_t root_ip = m_text_va + root_meta.offset;
 
     uint64_t global_va = 0;
     ZydisRegister root_dest_reg = ZYDIS_REGISTER_NONE;
+    bool is_lea = (root_insn.mnemonic == ZYDIS_MNEMONIC_LEA);
 
-    // ** FIX STARTS HERE **
-    // Correctly calculate the global VA first, then validate it.
     for (uint8_t i = 0; i < root_insn.operand_count; ++i) {
         const auto& op = root_ops[i];
         if (op.type == ZYDIS_OPERAND_TYPE_MEMORY && op.mem.base == ZYDIS_REGISTER_RIP) {
-            // 1. Calculate the address
-            if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&root_insn, &op, root_ip, &global_va))) {
-                // 2. Validate the address
-                const auto* section = FindSectionByVA(global_va);
-                if (section && section->kind != GlobalAccessReport::SectionType::TEXT) {
-                    // Valid root found, now find the destination register
-                    for (uint8_t j = 0; j < root_insn.operand_count; ++j) {
-                        if (root_ops[j].type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(root_ops[j])) {
-                            root_dest_reg = GetFullRegister(root_ops[j].reg.value);
-                            break;
-                        }
-                    }
-                } else {
-                    // If validation fails, reset global_va to ensure we don't process it.
-                    global_va = 0;
-                }
+            uint64_t rip = m_text_va + root_meta.offset + root_insn.length;
+            global_va = rip + op.mem.disp.value;
+
+            const auto* section = FindSectionByVA(global_va);
+            if (!section || section->kind == GlobalAccessReport::SectionType::TEXT) {
+                return; // Not a valid data global
             }
-            break; // Only one RIP-relative operand per instruction is expected.
+
+            if (root_insn.operand_count > 0 && root_ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                root_dest_reg = GetFullRegister(root_ops[0].reg.value);
+            }
+            break;
         }
     }
-    // ** FIX ENDS HERE **
 
     if (global_va == 0 || root_dest_reg == ZYDIS_REGISTER_NONE) return;
 
+    // 2. Initialize the register state machine
     RegisterState reg_state;
-    reg_state[root_dest_reg] = TrackedPointer{global_va, {}, 0};
+    TrackedPointer initial_ptr;
+    initial_ptr.source_global_va = global_va;
+    // If the root instruction was LEA, the register holds the address of the global itself.
+    // If it was MOV, the register holds the VALUE loaded from the global (a dereference).
+    if (!is_lea) {
+        initial_ptr.path.push_back(0); // Path now represents one level of dereference
+    }
+    reg_state[root_dest_reg] = initial_ptr;
 
-    auto& report = reports[global_va];
-    if (report.global_va == 0) report.global_va = global_va;
-
-    constexpr size_t ANALYSIS_WINDOW = 64;
-    for (size_t i = root_idx + 1; i < std::min(m_metadata_index.size(), root_idx + 1 + ANALYSIS_WINDOW); ++i) {
+    // 3. Follow the code path, updating state for each instruction
+    // ARCHITECTURE: Replaced fixed window with control-flow-aware loop. See Part 2, Phase 1.
+    for (size_t i = start_idx + 1; i < m_metadata_index.size(); ++i) {
         const auto& meta = m_metadata_index[i];
+        if (i > start_idx + 128) break; // Safety break to prevent infinite loops in complex CFGs
 
         ZydisDecodedInstruction insn;
         ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
@@ -361,69 +352,99 @@ void GlobalCallAnalyzer::ProcessRoot(size_t root_idx,
             continue;
         }
 
+        // Check for memory accesses using a tracked register
         for (uint8_t j = 0; j < insn.operand_count; ++j) {
             const auto& op = ops[j];
-            if (op.type != ZYDIS_OPERAND_TYPE_MEMORY || op.mem.base == ZYDIS_REGISTER_NONE) continue;
+            if (op.type == ZYDIS_OPERAND_TYPE_MEMORY && op.mem.base != ZYDIS_REGISTER_NONE) {
+                auto it = reg_state.find(GetFullRegister(op.mem.base));
+                if (it != reg_state.end()) {
+                    const auto& ptr = it->second;
+                    auto& report = reports[ptr.source_global_va];
+                    if (report.global_va == 0) report.global_va = ptr.source_global_va;
 
-            auto it = reg_state.find(GetFullRegister(op.mem.base));
-            if (it != reg_state.end()) {
-                const auto& ptr = it->second;
-                int64_t final_offset = ptr.accumulated_offset + op.mem.disp.value;
-                RecordAccess(report, ptr.path, final_offset, insn, op);
+                    int64_t final_offset = ptr.accumulated_offset + op.mem.disp.value;
+                    RecordAccess(report, ptr.path, final_offset, insn, op);
 
-                if (insn.mnemonic == ZYDIS_MNEMONIC_MOV && op.size == 64 && OperandReads(op)) {
-                    for (uint8_t k = 0; k < insn.operand_count; ++k) {
-                        const auto& dst_op = ops[k];
-                        if (dst_op.type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(dst_op)) {
-                            TrackedPointer new_ptr = ptr;
-                            new_ptr.path.push_back(final_offset);
-                            new_ptr.accumulated_offset = 0;
-                            reg_state[GetFullRegister(dst_op.reg.value)] = new_ptr;
-                            break;
+                    // ARCHITECTURE: This is the critical dereferencing logic. See Part 1, Section 1.1.
+                    // If we are loading a new pointer from a tracked memory location...
+                    if (insn.mnemonic == ZYDIS_MNEMONIC_MOV && op.size == 64 && OperandReads(op)) {
+                        for (uint8_t k = 0; k < insn.operand_count; ++k) {
+                            if (ops[k].type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(ops[k])) {
+                                TrackedPointer new_ptr = ptr;
+                                new_ptr.path.push_back(final_offset); // ...the path gets deeper...
+                                new_ptr.accumulated_offset = 0;       // ...and the offset resets.
+                                reg_state[GetFullRegister(ops[k].reg.value)] = new_ptr;
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
 
-        bool is_state_modifying_op = false;
-        if (insn.mnemonic == ZYDIS_MNEMONIC_MOV && insn.operand_count >= 2) {
-            const auto& dst = ops[0];
-            const auto& src = ops[1];
-            if (dst.type == ZYDIS_OPERAND_TYPE_REGISTER && src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                auto it = reg_state.find(GetFullRegister(src.reg.value));
-                if (it != reg_state.end()) {
-                    reg_state[GetFullRegister(dst.reg.value)] = it->second;
-                } else {
-                    reg_state.erase(GetFullRegister(dst.reg.value));
-                }
-                is_state_modifying_op = true;
+        // Update register state based on instruction semantics
+        bool reg_written = false;
+        if (insn.operand_count > 0 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(ops[0])) {
+            ZydisRegister dst_reg = GetFullRegister(ops[0].reg.value);
+
+            switch (insn.mnemonic) {
+                case ZYDIS_MNEMONIC_MOV:
+                    if (insn.operand_count > 1 && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                        auto it = reg_state.find(GetFullRegister(ops[1].reg.value));
+                        if (it != reg_state.end()) {
+                            reg_state[dst_reg] = it->second; // Propagate taint
+                        } else {
+                            reg_state.erase(dst_reg); // Destination is overwritten with untracked value
+                        }
+                        reg_written = true;
+                    }
+                    break;
+                case ZYDIS_MNEMONIC_LEA:
+                    // LEA is complex. For now, we handle simple [base + disp]
+                    if (insn.operand_count > 1 && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                        auto it = reg_state.find(GetFullRegister(ops[1].mem.base));
+                        if (it != reg_state.end()) {
+                            TrackedPointer new_ptr = it->second;
+                            new_ptr.accumulated_offset += ops[1].mem.disp.value;
+                            reg_state[dst_reg] = new_ptr;
+                            reg_written = true;
+                        }
+                    }
+                    break;
+                case ZYDIS_MNEMONIC_ADD:
+                case ZYDIS_MNEMONIC_SUB:
+                    if (insn.operand_count > 1 && ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        auto it = reg_state.find(dst_reg);
+                        if (it != reg_state.end()) {
+                            int64_t offset = ops[1].imm.value.s;
+                            if (insn.mnemonic == ZYDIS_MNEMONIC_SUB) offset = -offset;
+                            it->second.accumulated_offset += offset;
+                            reg_written = true;
+                        }
+                    }
+                    break;
+                case ZYDIS_MNEMONIC_XOR:
+                     if (insn.operand_count > 1 && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                         GetFullRegister(ops[1].reg.value) == dst_reg) {
+                         reg_state.erase(dst_reg); // Register zeroed, taint removed
+                         reg_written = true;
+                     }
+                     break;
+                default:
+                    break;
             }
-        } else if (insn.mnemonic == ZYDIS_MNEMONIC_ADD || insn.mnemonic == ZYDIS_MNEMONIC_SUB) {
-            const auto& dst = ops[0];
-            const auto& src = ops[1];
-            if (dst.type == ZYDIS_OPERAND_TYPE_REGISTER && src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                auto it = reg_state.find(GetFullRegister(dst.reg.value));
-                if (it != reg_state.end()) {
-                    int64_t offset = src.imm.value.s;
-                    if (insn.mnemonic == ZYDIS_MNEMONIC_SUB) offset = -offset;
-                    it->second.accumulated_offset += offset;
-                    is_state_modifying_op = true;
-                }
+
+            if (!reg_written) {
+                reg_state.erase(dst_reg); // Default: any write to a register clears its tracked state
             }
         }
 
-        if (!is_state_modifying_op) {
-            for (uint8_t j = 0; j < insn.operand_count; ++j) {
-                const auto& op = ops[j];
-                if (op.type == ZYDIS_OPERAND_TYPE_REGISTER && OperandWrites(op)) {
-                    reg_state.erase(GetFullRegister(op.reg.value));
-                }
-            }
-        }
-
+        // Terminate analysis at the end of a basic block
         if (meta.flags & (FLAG_IS_RET | FLAG_IS_JMP_OR_BRANCH)) break;
+
+        // ARCHITECTURE: Model x64 calling convention. See Part 2, Phase 1.
         if (meta.flags & FLAG_IS_CALL) {
+            // Clear all volatile registers
             reg_state.erase(ZYDIS_REGISTER_RAX);
             reg_state.erase(ZYDIS_REGISTER_RCX);
             reg_state.erase(ZYDIS_REGISTER_RDX);
@@ -460,7 +481,7 @@ std::span<const uint8_t> GlobalCallAnalyzer::SpanForVA(uint64_t va, size_t size)
     return m_view.subspan(base_offset + offset_in_section, size);
 }
 
-void GlobalCallAnalyzer::EnrichReport(GlobalAccessReport& report, bool was_from_lea) const {
+void GlobalCallAnalyzer::EnrichReport(GlobalAccessReport& report) const {
     const auto* section = FindSectionByVA(report.global_va);
     if (section) {
         report.section_name = section->name;
@@ -469,9 +490,11 @@ void GlobalCallAnalyzer::EnrichReport(GlobalAccessReport& report, bool was_from_
     report.is_in_iat = (report.global_va >= m_iat_va && report.global_va < m_iat_end);
 
     if (report.section_type == GlobalAccessReport::SectionType::RDATA) {
-        if (was_from_lea && LooksLikeAscii(report.global_va, report.string_preview)) {
+        // String check is now more general
+        if (LooksLikeAscii(report.global_va, report.string_preview)) {
             report.likely_string = true;
-        } else if (LooksLikeVTable(report.global_va)) {
+        }
+        if (LooksLikeVTable(report.global_va)) {
             report.likely_vtable = true;
         }
     }

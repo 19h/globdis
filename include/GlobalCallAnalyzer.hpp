@@ -4,12 +4,10 @@
 #include <span>
 #include <vector>
 #include <string>
-#include <span>
 #include <unordered_map>
 #include <Zydis/Zydis.h>
-#include "PEDefs.hpp" // Cross-platform PE definitions
+#include "PEDefs.hpp"
 
-// Define GCA_ENABLE_PAR to 0 to disable C++17 parallel algorithms for debugging or on unsupported compilers.
 #ifndef GCA_ENABLE_PAR
 #define GCA_ENABLE_PAR 1
 #endif
@@ -124,10 +122,13 @@ private:
      */
     struct TrackedPointer {
         uint64_t source_global_va = 0;  ///< The root global variable this pointer originated from.
-        /// @brief The sequence of offsets taken to reach this pointer. Empty for a root pointer.
-        /// e.g., for `A->B->C`, the path would be `{offset_of_B, offset_of_C}`.
+
+        // The sequence of offsets taken to reach this pointer.
+        // e.g., for `A->B->C`, where A is the global, the path for the pointer to C
+        // would be `{offset_of_B, offset_of_C}`.
         std::vector<int64_t> path;
-        /// @brief Pointer arithmetic (`ADD`/`SUB`/`LEA`) offset accumulated since the last dereference.
+
+        // Pointer arithmetic (`ADD`/`SUB`/`LEA`) offset accumulated since the last dereference.
         int64_t accumulated_offset = 0;
     };
 
@@ -174,11 +175,11 @@ private:
     const Section* FindSectionByVA(uint64_t va) const;
 
     // --- Core Analysis Pipeline ---
-    void ProcessRoot(size_t root_idx,
-                     std::unordered_map<uint64_t, GlobalAccessReport>& reports) const;
+    void FollowPath(size_t start_idx,
+                    std::unordered_map<uint64_t, GlobalAccessReport>& reports) const;
 
     // --- Heuristics & Classification ---
-    void EnrichReport(GlobalAccessReport& rep, bool was_from_lea) const;
+    void EnrichReport(GlobalAccessReport& rep) const;
     bool LooksLikeVTable(uint64_t va) const;
     bool LooksLikeAscii(uint64_t va, std::string& out_preview) const;
     bool LooksLikeJumpTablePattern(size_t root_index, ZydisRegister base_reg) const;
