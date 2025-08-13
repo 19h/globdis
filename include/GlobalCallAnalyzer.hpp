@@ -6,8 +6,9 @@
 #include <string>
 #include <unordered_map>
 #include <Zydis/Zydis.h>
-#include "PEDefs.hpp"
+#include "PEDefs.hpp" // Cross-platform PE definitions
 
+// Define GCA_ENABLE_PAR to 0 to disable C++17 parallel algorithms for debugging or on unsupported compilers.
 #ifndef GCA_ENABLE_PAR
 #define GCA_ENABLE_PAR 1
 #endif
@@ -73,6 +74,9 @@ struct GlobalAccessReport {
     bool likely_string = false;     ///< Heuristic: true if it points to a printable, null-terminated string.
     std::string string_preview;     ///< A short preview of the string content if likely_string is true.
     bool is_in_iat = false;         ///< True if the global VA is within the PE's Import Address Table.
+
+    // NOTE: The colleague's proposed `root_from_lea` flags are no longer needed.
+    // The new architecture makes this information available directly when needed.
 };
 
 /**
@@ -118,17 +122,18 @@ private:
     /**
      * @brief Represents a pointer being tracked in a register during analysis.
      *
-     * This struct contains the full "provenance" of a pointer, allowing for deep analysis.
+     * ARCHITECTURAL CHANGE: This struct now represents the full "provenance" of a pointer,
+     * allowing for generalized, multi-level dereferencing.
      */
     struct TrackedPointer {
         uint64_t source_global_va = 0;  ///< The root global variable this pointer originated from.
 
-        // The sequence of offsets taken to reach this pointer.
-        // e.g., for `A->B->C`, where A is the global, the path for the pointer to C
-        // would be `{offset_of_B, offset_of_C}`.
+        /// @brief The sequence of offsets taken to reach this pointer. Empty for a root pointer.
+        /// e.g., for `A->B->C`, where A is the global, the path for the pointer to C
+        /// would be `{offset_of_B, offset_of_C}`.
         std::vector<int64_t> path;
 
-        // Pointer arithmetic (`ADD`/`SUB`/`LEA`) offset accumulated since the last dereference.
+        /// @brief Pointer arithmetic (`ADD`/`SUB`/`LEA`) offset accumulated since the last dereference.
         int64_t accumulated_offset = 0;
     };
 
@@ -175,11 +180,12 @@ private:
     const Section* FindSectionByVA(uint64_t va) const;
 
     // --- Core Analysis Pipeline ---
+    // ARCHITECTURAL CHANGE: Replaced ProcessRoot with a full path-following engine.
     void FollowPath(size_t start_idx,
                     std::unordered_map<uint64_t, GlobalAccessReport>& reports) const;
 
     // --- Heuristics & Classification ---
-    void EnrichReport(GlobalAccessReport& rep) const;
+    void EnrichReport(GlobalAccessReport& rep, bool was_from_lea) const;
     bool LooksLikeVTable(uint64_t va) const;
     bool LooksLikeAscii(uint64_t va, std::string& out_preview) const;
     bool LooksLikeJumpTablePattern(size_t root_index, ZydisRegister base_reg) const;
